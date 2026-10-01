@@ -28,9 +28,12 @@ class JingQiService : AccessibilityService() {
     private lateinit var prefs: Preferences
     private var epoch = 0
     private var sceneRevision = 0L
+    private var interactionRevision = 0L
     private var lastShot = 0L
     private var ocrAttempts = 0
     private var lastOcr = 0L
+    private var ocrRunning = false
+    private var ocrJob = 0
     private var ownClick: UiNode? = null
     private var ownClickAt = 0L
     private var gestureInFlight = false
@@ -75,7 +78,8 @@ class JingQiService : AccessibilityService() {
 
     private fun newSession() {
         scans.stop(); epoch++; noted = false; rejectionNoted = false; refusalNoted = false
-        ocrAttempts = 0; lastOcr = 0; ownClick = null; gestureInFlight = false; reportedFindings.clear()
+        ocrAttempts = 0; lastOcr = 0; ocrRunning = false; ocrJob++
+        ownClick = null; gestureInFlight = false; reportedFindings.clear()
     }
     private fun clearSession() { engine.reset(); newSession() }
     private fun active() = ::prefs.isInitialized && prefs.enabled && prefs.consent
@@ -102,6 +106,7 @@ class JingQiService : AccessibilityService() {
         // Touch-start events may have no package. An interaction during recovery cancels further actions.
         if (event.eventType == AccessibilityEvent.TYPE_TOUCH_INTERACTION_START) {
             if (gestureInFlight) return
+            interactionRevision++
             if (engine.hasPending(clock)) engine.returnFailed()
             engine.userClicked(clock)
             return
@@ -110,11 +115,13 @@ class JingQiService : AccessibilityService() {
         if (pkg == engine.source || event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) sceneRevision++
         if (event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
             if (pkg == engine.source && isOwnClick(event)) return
+            interactionRevision++
             if (engine.hasPending(clock)) engine.returnFailed()
             if (pkg == engine.source) engine.userClicked(clock)
             return
         }
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            interactionRevision++
             if (pkg == "cn.jingqi.demo" && event.className?.toString() == "cn.jingqi.demo.MainActivity") { clearSession(); return }
             val destination = if (pkg == packageName && event.className?.toString()?.endsWith("DemoLandingActivity") == true)
                 "cn.jingqi.demo.target" else pkg
@@ -283,8 +290,8 @@ class JingQiService : AccessibilityService() {
                 // apply to what is actually tapped.
                 val via = clickableAncestor?.takeIf { !clickable && label.isNotBlank() &&
                     Detector.safeBounds(it.info.bounds, screenWidth, screenHeight, density) }
-                val captured = if (via != null) Captured(UiNode(label, via.info.id, via.info.bounds, true), node, topmost, via.node)
-                    else Captured(UiNode(label, node.viewIdResourceName.orEmpty(), box, clickable), node, topmost)
+                val captured = if (via != null) Captured(UiNode(label, via.info.id, via.info.bounds, true, node.isEnabled), node, topmost, via.node)
+                    else Captured(UiNode(label, node.viewIdResourceName.orEmpty(), box, clickable, node.isEnabled), node, topmost)
                 result += captured
                 val ancestorForChildren = if (clickable) captured else clickableAncestor
                 for (i in 0 until minOf(node.childCount, 80)) node.getChild(i)?.let { queue.add(it to ancestorForChildren) }
@@ -301,7 +308,6 @@ class JingQiService : AccessibilityService() {
         val pkg = engine.source ?: return
         if (pkg in prefs.excluded || foregroundPackage() != pkg) return
         val captured = collectAll(pkg)
-        if (captured.isEmpty()) return
         try {
             val dm = resources.displayMetrics
             val (screenWidth, screenHeight) = screenSize()
@@ -314,7 +320,7 @@ class JingQiService : AccessibilityService() {
                 reportedFindings += freshFindings.map { it.title }
                 val event = GuardEvent(kind = "EVIDENCE", source = pkg,
                     detail = freshFindings.joinToString("\n") { "${it.title}：${it.detail}" }.ifEmpty { "识别到疑似开屏页面，留存本地观察记录。" } +
-                        "\n识别时点：进入应用后 ${engine.elapsed(now())} 毫秒；${if (result.candidate != null) "找到可操作的唯一跳过控件" else result.rejection ?: "尚未找到可操作的跳过控件"}。")
+                        "\n识别时点：进入应用后 ${engine.elapsed(now())} 毫秒；${if (result.candidate != null) "找到可操作的唯一跳过控件" else if (result.touchCandidate != null) "找到带广告标记的右上角自绘跳过文字" else result.rejection ?: "尚未找到可操作的跳过控件"}。")
                 Store.log(event)
                 if (prefs.screenshots) captureEvidence(event, result.findings)
             }
@@ -324,12 +330,22 @@ class JingQiService : AccessibilityService() {
                 rejectionNoted = true
                 Store.log(GuardEvent(kind = "NOTICE", source = pkg, detail = "识别到跳过文字但未操作：${result.rejection}可将此记录反馈给开发者改进识别。"))
             }
-            val hit = result.candidate?.let { candidate -> captured.firstOrNull { it.info == candidate } }
+            val hit = (result.candidate ?: result.touchCandidate)?.let { candidate -> captured.firstOrNull { it.info == candidate } }
             if (hit != null && !engine.skipAttempted) {
                 val seconds = result.countdown?.coerceIn(0, 5) ?: 0
                 val started = now()
                 expectOwnClick(hit.info)
                 when {
+                    result.touchCandidate != null && hit.topmost -> {
+                        engine.markSkip(); scans.stop()
+                        tapSkip(pkg, hit.info, seconds, "自绘跳过文字或文字区域较小，已同时识别广告标记", started)
+                    }
+                    result.touchCandidate != null -> {
+                        if (!refusalNoted) {
+                            refusalNoted = true
+                            Store.log(GuardEvent(kind = "NOTICE", source = pkg, detail = "识别到右上角自绘跳过文字，但其窗口不是顶层，未触摸。"))
+                        }
+                    }
                     hit.clickTarget.performAction(AccessibilityNodeInfo.ACTION_CLICK) -> {
                         engine.markSkip(); scans.stop(); verifySkip(pkg, epoch, hit.info, seconds, started)
                     }
@@ -344,7 +360,7 @@ class JingQiService : AccessibilityService() {
                             detail = "系统拒绝了对唯一角落跳过控件的无障碍点击；控件不在顶层窗口，为避免误触未改用模拟触摸。可将此记录反馈给开发者。"))
                     }
                 }
-            } else if (prefs.ocr && !engine.skipAttempted && ocrAttempts < 3 && now() - lastOcr >= 900 &&
+            } else if (prefs.ocr && !ocrRunning && !engine.skipAttempted && ocrAttempts < 3 && now() - lastOcr >= 900 &&
                 Build.VERSION.SDK_INT >= 30 && engine.elapsed(now()) > 500) {
                 ocrAttempts++; lastOcr = now()
                 runOcr(pkg, epoch)
@@ -424,8 +440,9 @@ class JingQiService : AccessibilityService() {
         val captured = collectAll(pkg)
         return try {
             val (width, height) = screenSize()
-            val candidate = Detector.analyze(pkg, engine.elapsed(now()), captured.map { it.info },
-                width, height, resources.displayMetrics.density, Store.rules).candidate ?: return null
+            val analysis = Detector.analyze(pkg, engine.elapsed(now()), captured.map { it.info },
+                width, height, resources.displayMetrics.density, Store.rules)
+            val candidate = analysis.candidate ?: analysis.touchCandidate ?: return null
             candidate.takeIf { it.bounds == clicked.bounds &&
                 (clicked.id.isBlank() || it.id == clicked.id) && captured.any { node -> node.info == it && node.topmost } }
         } finally { captured.forEach { it.node.recycle() } }
@@ -481,53 +498,91 @@ class JingQiService : AccessibilityService() {
     }
 
     private fun runOcr(pkg: String, ticket: Int) {
-        val revision = sceneRevision
+        val revision = interactionRevision
+        val job = ++ocrJob
+        val started = now()
+        val viewport = screenSize()
+        val density = resources.displayMetrics.density
+        ocrRunning = true
+        fun finish() { if (ticket == epoch && job == ocrJob) ocrRunning = false }
+        fun allowed(): Boolean = ocrRunning && job == ocrJob && prefs.ocr && revision == interactionRevision &&
+            screenSize() == viewport && resources.displayMetrics.density == density &&
+            now() - started in 0..2_500 && !engine.skipAttempted && !engine.hasPending(now()) && stillCurrent(pkg, ticket)
+        // Animating progress rings change content continuously. Invalidate on user interaction/session changes,
+        // then compare two fresh OCR targets instead of rejecting every content-change event.
+        handler.postDelayed({ finish() }, 2_500)
         screenshot { bitmap ->
-            if (bitmap == null) return@screenshot
-            if (!prefs.ocr || revision != sceneRevision || !stillCurrent(pkg, ticket)) { bitmap.recycle(); return@screenshot }
-            usedRecognizer = true
+            if (bitmap == null) { finish(); return@screenshot }
+            if (!allowed()) { bitmap.recycle(); finish(); return@screenshot }
+            readOcrFrame(bitmap) firstFrame@ { first ->
+                val firstTarget = first?.candidate
+                if (!allowed() || firstTarget == null) { finish(); return@firstFrame }
+                // Respect screenshot throttling and obtain a different frame before touching the screen.
+                handler.postDelayed({
+                    if (!allowed()) { finish(); return@postDelayed }
+                    val capturedAt = now()
+                    screenshot secondShot@ { freshBitmap ->
+                        if (freshBitmap == null) { finish(); return@secondShot }
+                        if (!allowed()) { freshBitmap.recycle(); finish(); return@secondShot }
+                        readOcrFrame(freshBitmap) secondFrame@ { result ->
+                            if (!allowed() || now() - capturedAt > 700 || result == null) { finish(); return@secondFrame }
+                            val target = Detector.confirmOcrTarget(firstTarget, result, resources.displayMetrics.density)
+                            if (target == null) { finish(); return@secondFrame }
+                            val roots = roots(pkg)
+                            @Suppress("DEPRECATION") roots.forEach { it.first.recycle() }
+                            if (roots.none { it.second }) { finish(); return@secondFrame }
+                            finish()
+                            performOcrSkip(pkg, ticket, target, result)
+                        }
+                    }
+                }, (450 - (now() - lastShot)).coerceAtLeast(0))
+            }
+        }
+    }
+
+    /** Each recognizer task owns and releases its bitmap, including rejected and failed frames. */
+    private fun readOcrFrame(bitmap: Bitmap, callback: (Analysis?) -> Unit) {
+        val (width, height) = screenSize()
+        if (bitmap.width != width || bitmap.height != height) { bitmap.recycle(); callback(null); return }
+        usedRecognizer = true
+        try {
             recognizer.process(InputImage.fromBitmap(bitmap, 0))
                 .addOnSuccessListener { text ->
-                    if (!prefs.ocr || revision != sceneRevision || !stillCurrent(pkg, ticket) || engine.skipAttempted) return@addOnSuccessListener
-                    val dm = resources.displayMetrics
-                    val (screenWidth, screenHeight) = screenSize()
-                    if (bitmap.width != screenWidth || bitmap.height != screenHeight) return@addOnSuccessListener
                     val nodes = text.textBlocks.flatMap { it.lines }.mapNotNull { line -> line.boundingBox?.let { r ->
                         UiNode(line.text, "ocr", Box(r.left, r.top, r.right, r.bottom), true)
                     } }
-                    // OCR requires an explicit advertisement label in the same image in addition to the skip button.
-                    // OCR often merges the label with neighbours ("广告 | 了解详情"), so accept it inside a short line only.
-                    if (nodes.none { val t = it.text.trim(); (t.contains("广告") && t.length <= 8) || t.equals("Ad", true) ||
-                            t.equals("Advertisement", true) }) return@addOnSuccessListener
-                    val result = Detector.analyze(pkg, engine.elapsed(now()), nodes, bitmap.width, bitmap.height, dm.density)
-                    val b = result.candidate?.bounds ?: return@addOnSuccessListener
-                    engine.observeAd(true, now())
-                    engine.markSkip(); scans.stop()
-                    val anchor = imageButtonAt(pkg, b.centerX, b.centerY)
-                    expectOwnClick(result.candidate!!)
-                    gestureInFlight = true
-                    val path = Path().apply { moveTo(b.centerX.toFloat(), b.centerY.toFloat()) }
-                    val sent = dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 55)).build(),
-                        object : GestureResultCallback() {
-                            override fun onCompleted(gestureDescription: GestureDescription?) {
-                                if (ticket == epoch) gestureInFlight = false
-                                Store.log(GuardEvent(kind = "SKIP", source = pkg, estimatedSeconds = result.countdown?.coerceIn(0, 5) ?: 0,
-                                    detail = "本地 OCR 识别唯一角落跳过文字与广告标记，系统完成了点击手势；广告关闭结果需人工核实。"))
-                                anchor?.let { learnIfGone(pkg, it) }
-                            }
-                            override fun onCancelled(gestureDescription: GestureDescription?) {
-                                if (ticket == epoch) gestureInFlight = false
-                                Store.log(GuardEvent(kind = "NOTICE", source = pkg,
-                                    detail = "OCR 识别到跳过文字，但系统取消了点击手势；本次未计入跳过次数。"))
-                            }
-                        }, handler)
-                    if (!sent) {
-                        gestureInFlight = false
-                        Store.log(GuardEvent(kind = "NOTICE", source = pkg, detail = "系统未接受 OCR 点击手势；未计入跳过次数。"))
-                    }
+                    callback(Detector.analyzeOcr(engine.elapsed(now()), nodes, width, height, resources.displayMetrics.density))
                 }
-                .addOnFailureListener { /* No action on uncertain OCR. */ }
+                .addOnFailureListener { callback(null) }
                 .addOnCompleteListener { bitmap.recycle() }
+        } catch (_: Exception) { bitmap.recycle(); callback(null) }
+    }
+
+    private fun performOcrSkip(pkg: String, ticket: Int, target: UiNode, result: Analysis) {
+        val b = target.bounds
+        engine.observeAd(true, now())
+        engine.markSkip(); scans.stop()
+        val anchor = imageButtonAt(pkg, b.centerX, b.centerY)
+        expectOwnClick(target)
+        gestureInFlight = true
+        val path = Path().apply { moveTo(b.centerX.toFloat(), b.centerY.toFloat()) }
+        val sent = dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 55)).build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (ticket == epoch) gestureInFlight = false
+                    Store.log(GuardEvent(kind = "SKIP", source = pkg, estimatedSeconds = result.countdown?.coerceIn(0, 5) ?: 0,
+                        detail = "本地 OCR 在两张独立画面中确认同位置的唯一角落跳过文字与广告标记，系统完成了点击手势；广告关闭结果需人工核实。"))
+                    anchor?.let { learnIfGone(pkg, it) }
+                }
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    if (ticket == epoch) gestureInFlight = false
+                    Store.log(GuardEvent(kind = "NOTICE", source = pkg,
+                        detail = "OCR 识别到跳过文字，但系统取消了点击手势；本次未计入跳过次数。"))
+                }
+            }, handler)
+        if (!sent) {
+            gestureInFlight = false
+            Store.log(GuardEvent(kind = "NOTICE", source = pkg, detail = "系统未接受 OCR 点击手势；未计入跳过次数。"))
         }
     }
 
@@ -541,7 +596,7 @@ class JingQiService : AccessibilityService() {
         return try {
             val (screenWidth, screenHeight) = screenSize()
             val density = resources.displayMetrics.density
-            captured.map { it.info }.filter { it.actionable && it.text.isBlank() && it.id.isNotBlank() &&
+            captured.filter { it.topmost }.map { it.info }.filter { it.enabled && it.actionable && it.text.isBlank() && it.id.isNotBlank() &&
                 x in it.bounds.left..it.bounds.right && y in it.bounds.top..it.bounds.bottom &&
                 Detector.safeBounds(it.bounds, screenWidth, screenHeight, density) }
                 .distinctBy { it.id to it.bounds }.singleOrNull()

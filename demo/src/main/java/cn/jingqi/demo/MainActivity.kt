@@ -7,6 +7,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.*
 import android.view.*
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityEvent
 import android.widget.*
 
 class MainActivity : Activity() {
@@ -27,7 +28,9 @@ class MainActivity : Activity() {
             Triple("nested", "07  容器内跳过文字", "文字本身不可点、外层小容器可点；预期自动跳过"),
             Triple("touch", "08  只认真实触摸", "忽略无障碍点击，只响应触摸；预期改用模拟触摸后跳过"),
             Triple("refuse", "09  拒绝无障碍点击", "直接拒绝无障碍点击；预期立即改用模拟触摸后跳过"),
-            Triple("adclick", "10  误点广告后返回", "点击模拟广告；开启误触保护时预期返回，关闭时放行")
+            Triple("adclick", "10  误点广告后返回", "点击模拟广告；开启误触保护时预期返回，关闭时放行"),
+            Triple("ring", "11  圆环跳过文字", "可读文字不可点；识别广告标记后触摸圆心"),
+            Triple("ringocr", "12  圆环图片跳过", "动画画布，无文字节点；需 Android 11+ 和本地 OCR")
         )
         scenarios.forEach { (mode, title, description) ->
             column.addView(Button(this).apply {
@@ -66,8 +69,8 @@ class SplashActivity : Activity() {
         frame = FrameLayout(this).apply { setBackgroundColor(Color.rgb(233, 240, 220)); fitsSystemWindows = true }
         setContentView(frame)
         if (complete) { showComplete("本场景已结束"); return }
-        if (mode == "ocr") {
-            frame.addView(CanvasAd(this), FrameLayout.LayoutParams(-1, -1))
+        if (mode == "ocr" || mode == "ringocr") {
+            frame.addView(CanvasAd(this, mode == "ringocr"), FrameLayout.LayoutParams(-1, -1))
         } else {
             val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER; setPadding(d(28), d(80), d(28), d(24)) }
             body.addView(label(if (mode == "intent") "普通页面\n自由浏览。" else "留一点时间，\n给生活。", 38f))
@@ -79,7 +82,7 @@ class SplashActivity : Activity() {
             if (mode == "evidence") body.addView(label("演示：倒计时偏长且无可读跳过控件\n请等待记录后返回查看报告", 15f))
             frame.addView(body, FrameLayout.LayoutParams(-1, -1))
             if (mode != "intent") {
-                frame.addView(label("广告", 13f), FrameLayout.LayoutParams(d(60), d(36), Gravity.BOTTOM or Gravity.LEFT).apply { leftMargin = d(12); bottomMargin = d(38) })
+                frame.addView(label(if (mode == "ring") "AM广告" else "广告", 13f), FrameLayout.LayoutParams(d(60), d(36), Gravity.BOTTOM or Gravity.LEFT).apply { leftMargin = d(12); bottomMargin = d(38) })
                 val counter = label(if (mode == "evidence") "8s" else "5s", 16f)
                 frame.addView(counter, FrameLayout.LayoutParams(d(70), d(40), Gravity.TOP or Gravity.LEFT).apply { leftMargin = d(16); topMargin = d(38) })
             }
@@ -87,6 +90,7 @@ class SplashActivity : Activity() {
             if (mode == "ambiguous") addSkip(Gravity.BOTTOM or Gravity.RIGHT)
             if (mode == "nested") addNestedSkip()
             if (mode == "touch" || mode == "refuse") addTouchOnlySkip(refuseAccessibility = mode == "refuse")
+            if (mode == "ring") addRingSkip()
         }
         if (mode == "jump" && !jumped) handler.postDelayed({ if (!isFinishing && !complete) { jumped = true; openTarget() } }, 1_800)
         handler.postDelayed({ if (!isFinishing && !complete && !leftForTarget) showComplete("演示计时结束\n请到净启查看演示记录") }, if (mode == "evidence") 8_000 else 9_000)
@@ -131,6 +135,29 @@ class SplashActivity : Activity() {
         runCatching { startActivity(Intent().setComponent(ComponentName("cn.jingqi.guard", "cn.jingqi.guard.ui.DemoLandingActivity"))) }
             .onFailure { leftForTarget = false; Toast.makeText(this, "请先安装净启主应用", Toast.LENGTH_LONG).show() }
     }
+    /** The ring handles touches but exposes no click action; only the small child label is readable. */
+    private fun addRingSkip() {
+        val ring = object : FrameLayout(this) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.rgb(58, 180, 215); style = Paint.Style.STROKE; strokeWidth = d(3).toFloat()
+            }
+            private val oval = RectF()
+            init { setWillNotDraw(false) }
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                oval.set(d(3).toFloat(), d(3).toFloat(), (width - d(3)).toFloat(), (height - d(3)).toFloat())
+                canvas.drawArc(oval, -90f, 360f * (1f - (SystemClock.uptimeMillis() % 5_000) / 5_000f), false, paint)
+                if (!complete) postInvalidateDelayed(80)
+            }
+            override fun onTouchEvent(event: MotionEvent): Boolean {
+                if (event.action == MotionEvent.ACTION_UP) { performClick(); showComplete("圆环跳过已触发\n广告页面已关闭") }
+                return true
+            }
+            override fun performClick(): Boolean { super.performClick(); return true }
+        }
+        ring.addView(label("跳过", 14f).apply { includeFontPadding = false }, FrameLayout.LayoutParams(d(40), d(18), Gravity.CENTER))
+        frame.addView(ring, FrameLayout.LayoutParams(d(56), d(56), Gravity.TOP or Gravity.RIGHT).apply { rightMargin = d(16); topMargin = d(36) })
+    }
     override fun onResume() {
         super.onResume()
         if (leftForTarget) { leftForTarget = false; showComplete("已回到原应用\n请查看净启是否记录了“确认返回”") }
@@ -146,19 +173,37 @@ class SplashActivity : Activity() {
         frame.addView(body, FrameLayout.LayoutParams(-1, -1))
     }
     override fun onDestroy() { handler.removeCallbacksAndMessages(null); super.onDestroy() }
-    private inner class CanvasAd(context: Context) : View(context) {
+    private inner class CanvasAd(context: Context, private val ring: Boolean = false) : View(context) {
         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val hit = RectF()
+        private val announceAnimation = object : Runnable {
+            override fun run() {
+                if (!complete && isAttachedToWindow) {
+                    frame.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)
+                    handler.postDelayed(this, 80)
+                }
+            }
+        }
         init { importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO }
+        override fun onAttachedToWindow() { super.onAttachedToWindow(); if (ring) handler.post(announceAnimation) }
+        override fun onDetachedFromWindow() { handler.removeCallbacks(announceAnimation); super.onDetachedFromWindow() }
         override fun onDraw(canvas: Canvas) {
             canvas.drawColor(Color.rgb(233, 240, 220)); paint.color = Color.rgb(23, 70, 53); paint.textSize = d(16).toFloat()
-            canvas.drawText("广告", d(20).toFloat(), d(70).toFloat(), paint)
-            hit.set(width - d(106).toFloat(), d(38).toFloat(), width - d(16).toFloat(), d(88).toFloat())
-            paint.color = Color.WHITE; canvas.drawRoundRect(hit, d(16).toFloat(), d(16).toFloat(), paint)
-            paint.color = Color.rgb(23, 70, 53); paint.textSize = d(22).toFloat()
-            canvas.drawText("跳过", hit.left + d(20), hit.top + d(33), paint)
+            canvas.drawText(if (ring) "AM广告" else "广告", d(20).toFloat(), d(70).toFloat(), paint)
+            hit.set(width - d(if (ring) 72 else 106).toFloat(), d(38).toFloat(), width - d(16).toFloat(), d(if (ring) 94 else 88).toFloat())
+            paint.color = Color.WHITE
+            if (ring) canvas.drawOval(hit, paint) else canvas.drawRoundRect(hit, d(16).toFloat(), d(16).toFloat(), paint)
+            if (ring) {
+                paint.color = Color.rgb(58, 180, 215); paint.style = Paint.Style.STROKE; paint.strokeWidth = d(3).toFloat()
+                canvas.drawArc(hit, -90f, 360f * (1f - (SystemClock.uptimeMillis() % 5_000) / 5_000f), false, paint)
+                paint.style = Paint.Style.FILL
+            }
+            paint.color = Color.rgb(23, 70, 53); paint.textSize = d(if (ring) 18 else 22).toFloat()
+            val textWidth = paint.measureText("跳过")
+            canvas.drawText("跳过", hit.centerX() - textWidth / 2, hit.centerY() - (paint.ascent() + paint.descent()) / 2, paint)
             paint.textSize = d(32).toFloat(); canvas.drawText("清静一点。", d(42).toFloat(), height * .45f, paint)
             paint.textSize = d(15).toFloat(); canvas.drawText("图片文字场景 · 请开启本地 OCR", d(26).toFloat(), height * .55f, paint)
+            if (ring && !complete) postInvalidateDelayed(80)
         }
         override fun onTouchEvent(event: MotionEvent): Boolean {
             if (event.action == MotionEvent.ACTION_UP && hit.contains(event.x, event.y)) { performClick(); showComplete("画布跳过按钮已触发"); return true }

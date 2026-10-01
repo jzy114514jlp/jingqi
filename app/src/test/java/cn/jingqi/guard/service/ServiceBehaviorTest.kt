@@ -192,4 +192,52 @@ class ServiceBehaviorTest {
         jump()
         assertTrue(shadow.globalActionsPerformed.isEmpty())
     }
+    private fun ringForeground(ad: Boolean = true, enabled: Boolean = true, topmost: Boolean = true) {
+        foreground(source, ad = ad)
+        val root = shadow.activeRoot!!
+        if (ad) root.getChild(0).text = "AM广告"
+        // The full-screen ad is clickable, while its readable skip glyph is not an ACTION_CLICK target.
+        root.isClickable = true
+        shadowOf(root).addChild(node(source, "跳 过", bounds = Rect(305, 35, 335, 44)).apply { isEnabled = enabled })
+        if (!topmost) {
+            val covering = AccessibilityWindowInfo.obtain()
+            shadowOf(covering).apply {
+                setRoot(node("com.example.overlay")); setType(AccessibilityWindowInfo.TYPE_APPLICATION); setLayer(2)
+            }
+            val behind = AccessibilityWindowInfo.obtain()
+            shadowOf(behind).apply { setRoot(root); setType(AccessibilityWindowInfo.TYPE_APPLICATION); setLayer(1) }
+            shadow.setWindows(listOf(covering, behind))
+        }
+    }
+    @Test fun nonclickableRingLabelUsesItsOwnCenterWithoutClickingFullScreenAd() {
+        ringForeground()
+        event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED); waitMs(0)
+        assertEquals(1, shadow.gesturesDispatched.size)
+        assertTrue(shadowOf(shadow.activeRoot!!).performedActions.isEmpty())
+        val stroke = shadow.gesturesDispatched.single().description().getStroke(0)
+        val bounds = android.graphics.RectF(); stroke.path.computeBounds(bounds, true)
+        assertEquals(320f, bounds.left, .1f); assertEquals(39f, bounds.top, .1f)
+        event(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED); waitMs(1_000)
+        assertEquals(1, shadow.gesturesDispatched.size)
+    }
+    @Test fun ringGestureIsWithheldWithoutAdMarkerOrWhileDisabledOrCovered() {
+        ringForeground(ad = false); event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED); waitMs(300)
+        assertTrue(shadow.gesturesDispatched.isEmpty())
+        service.onInterrupt()
+        ringForeground(enabled = false); event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED); waitMs(300)
+        assertTrue(shadow.gesturesDispatched.isEmpty())
+        service.onInterrupt()
+        ringForeground(topmost = false); event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED); waitMs(300)
+        assertTrue(shadow.gesturesDispatched.isEmpty())
+    }
+    @Test fun contentAnimationDoesNotMasqueradeAsUserInteraction() {
+        foreground(source, ad = true); event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED); waitMs(0)
+        val before = ReflectionHelpers.getField<Long>(service, "interactionRevision")
+        repeat(10) { event(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED); waitMs(80) }
+        assertEquals(before, ReflectionHelpers.getField<Long>(service, "interactionRevision"))
+        event(AccessibilityEvent.TYPE_TOUCH_INTERACTION_START, null)
+        assertEquals(before + 1, ReflectionHelpers.getField<Long>(service, "interactionRevision"))
+        event(AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
+        assertEquals(before + 2, ReflectionHelpers.getField<Long>(service, "interactionRevision"))
+    }
 }

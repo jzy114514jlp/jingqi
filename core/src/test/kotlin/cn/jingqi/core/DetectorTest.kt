@@ -80,4 +80,48 @@ class DetectorTest {
         assertNull(analyze(node(b = Box(1000, 100, 1200, 180))).candidate)
         assertNull(analyze(node(b = Box(800, 100, 810, 110))).candidate)
     }
+    private val ringLabel = UiNode("跳 过", "", Box(900, 120, 972, 147), false)
+    private val adLabel = UiNode("AM广告", "", Box(930, 2200, 1040, 2245), false)
+    @Test fun sdkAdMarkersAndSpacedChineseLabelsAreRecognizedPrecisely() {
+        listOf("AM广告", "广告", "AD", "广告 | 了解详情").forEach { assertTrue(it, Detector.isAdLabel(it)) }
+        listOf("广告设置", "关闭广告", "我不想看广告", "广告abc", "跳过教程").forEach { assertFalse(it, Detector.isAdLabel(it)) }
+        assertTrue(Detector.isSkip("跳\n过")); assertFalse(Detector.isSkip("跳 过 此教程"))
+    }
+    @Test fun smallNonclickableRingLabelRequiresExplicitAdMarker() {
+        val result = analyze(ringLabel, adLabel)
+        assertTrue(result.isAd); assertNull(result.candidate); assertEquals(ringLabel, result.touchCandidate)
+        assertNull(analyze(ringLabel).touchCandidate)
+        assertNull(analyze(ringLabel, adLabel.copy(text = "广告设置")).touchCandidate)
+    }
+    @Test fun ringLabelsPreserveDisabledAmbiguousPositionAndSizeChecks() {
+        listOf(ringLabel.copy(enabled = false), ringLabel.copy(bounds = Box(30, 120, 102, 147)),
+            ringLabel.copy(bounds = Box(900, 2000, 972, 2027)), ringLabel.copy(bounds = Box(900, 120, 972, 140)),
+            ringLabel.copy(bounds = Box(700, 120, 1070, 400))).forEach {
+            assertNull(analyze(it, adLabel).touchCandidate)
+        }
+        val two = analyze(ringLabel, ringLabel.copy(bounds = Box(900, 200, 972, 227)), adLabel)
+        assertNull(two.candidate); assertNull(two.touchCandidate)
+        assertNull(analyze(ringLabel.copy(enabled = false), adLabel).candidate)
+    }
+    private fun ocr(vararg nodes: UiNode) = Detector.analyzeOcr(800, nodes.toList(), 1080, 2400, 3f)
+    @Test fun ocrRequiresAdMarkerAndSupportsSmallRingGlyphs() {
+        assertEquals(ringLabel.bounds, ocr(ringLabel, adLabel).candidate?.bounds)
+        assertNull(ocr(ringLabel).candidate)
+        assertNull(ocr(node(), adLabel.copy(text = "广告设置")).candidate)
+        assertNull(ocr(ringLabel, ringLabel.copy(bounds = Box(900, 200, 972, 227)), adLabel).candidate)
+        assertNull(Detector.analyzeOcr(10_001, listOf(ringLabel, adLabel), 1080, 2400, 3f).candidate)
+    }
+    @Test fun ocrConfirmsStablePositionDespiteCountdownAndMinorRecognitionJitter() {
+        val first = ocr(ringLabel, adLabel).candidate!!
+        val next = ringLabel.copy(text = "跳过 3", bounds = Box(902, 122, 974, 149))
+        assertEquals(next.bounds, Detector.confirmOcrTarget(first, ocr(next, adLabel), 3f)?.bounds)
+    }
+    @Test fun ocrRejectsMovedDisappearedOrAmbiguousTargets() {
+        val first = ocr(ringLabel, adLabel).candidate!!
+        assertNull(Detector.confirmOcrTarget(first, ocr(ringLabel.copy(bounds = Box(960, 180, 1032, 207)), adLabel), 3f))
+        assertNull(Detector.confirmOcrTarget(first, ocr(ringLabel), 3f))
+        assertNull(Detector.confirmOcrTarget(first, ocr(adLabel), 3f))
+        assertNull(Detector.confirmOcrTarget(first, ocr(ringLabel, ringLabel.copy(bounds = Box(900, 200, 972, 227)), adLabel), 3f))
+        assertNull(Detector.confirmOcrTarget(first, ocr(ringLabel, adLabel), 0f))
+    }
 }
