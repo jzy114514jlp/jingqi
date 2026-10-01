@@ -1,0 +1,1 @@
+device,android_version,app_name,package_name,app_version,jingqi_version,trial,scenario,ad_present,expected_action,actual_action,skip_success,false_click,return_success,false_return,measured_saved_seconds,latency_ms,notes

@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">净启</string>
+    <string name="service_description">帮助用户操作开屏广告中的跳过按钮；对已识别开屏广告的跳转尝试返回。误触保护默认开启，也会返回点击广告后的页面，可在设置中关闭。返回键无效时可能尝试打开原应用一次。会读取当前界面控件与应用名称，并模拟点击或返回。截图与本地 OCR 仅在应用内单独开启后使用。数据保存在本机，净启不申请联网权限。用户可主动通过邮件应用发送所选报告。可随时关闭。</string>
+    <style name="BaseAppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#176954</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">#F6F7F2</item>
+        <item name="android:navigationBarColor">#176954</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="AppTheme" parent="BaseAppTheme" />
+</resources>

@@ -1,0 +1,3 @@
+28c3dfc90f0e7608c1ee8638cad0bdcb37177c13655eb022303cbe56b9dd11e5  JingQi-debug.apk
+50944ffff98c9e85396b0cea4647812721ef5dceefa50076b439c85a14b65548  JingQi-Demo-debug.apk
+9dceae0c39794b9faef83a046dcb2f7b67a477b497dc73c958a8fc992392f977  JingQi-source.zip
